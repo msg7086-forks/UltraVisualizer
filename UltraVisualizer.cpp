@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <vector>
 #include "avisynth.h"
+#include "Decay.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -15,12 +16,6 @@ constexpr const T& clamp(const T& v, const T& lo, const T& hi)
 	return (v < lo) ? lo : (hi < v) ? hi : v;
 }
 #endif
-
-// Structure for an RGBA pixel of the internal clip
-struct PixelRGBA
-{
-	BYTE r, g, b, a;
-};
 
 // Helper function for color calculation of the frequency splines via cosine functions
 void
@@ -65,7 +60,9 @@ InterpolateSpline(const std::vector<float>& x_pts, const std::vector<float>& y_p
 class UltraVisualizer : public GenericVideoFilter
 {
 	int width, height;
+	DecayRows* const decay_rows;
 	std::vector<PixelRGBA> internal_buffer; // Internal storage clip in RGBA32 format
+	std::vector<PixelRGBA> next_buffer;
 
 	// Discrete Fourier Transform (DFT) as a standalone FFT replacement for an audio sample window
 	void
@@ -167,7 +164,8 @@ class UltraVisualizer : public GenericVideoFilter
 	}
 
 public:
-	UltraVisualizer(PClip _child, IScriptEnvironment* env) : GenericVideoFilter(_child)
+	UltraVisualizer(PClip _child, IScriptEnvironment* env)
+		: GenericVideoFilter(_child), decay_rows(SelectDecayRows(env->GetCPUFlags()))
 	{
 		if (!vi.HasVideo())
 		{
@@ -206,6 +204,7 @@ public:
 
 		// Initialize the internal storage clip with transparency (Alpha = 0)
 		internal_buffer.resize(width * height, PixelRGBA{ 0, 0, 0, 0 });
+		next_buffer.resize(internal_buffer.size());
 	}
 
 	int __stdcall SetCacheHints(int cachehints, int frame_range) override
@@ -337,39 +336,14 @@ public:
 				}
 			}
 		}
-		// --- 4. Pixel feedback/decay of the internal clip (Box blur attenuation) ---
-		std::vector<PixelRGBA> next_buffer(width * height);
-		auto get_pixel = [&](int x, int y) -> PixelRGBA
-			{
-				int cx = clamp(x, 0, width - 1);
-				int cy = clamp(y, 0, height - 1);
-				return internal_buffer[cy * width + cx];
-			};
-		for (int y = 0; y < height; ++y)
-		{
-			for (int x = 0; x < width; ++x)
-			{
-				PixelRGBA top = get_pixel(x, y - 1);
-				PixelRGBA bottom = get_pixel(x, y + 1);
-				PixelRGBA left = get_pixel(x - 1, y);
-				PixelRGBA right = get_pixel(x + 1, y);
-				PixelRGBA top2 = get_pixel(x, y - 2);
-				PixelRGBA bottom2 = get_pixel(x, y + 2);
-				PixelRGBA left2 = get_pixel(x - 2, y);
-				PixelRGBA right2 = get_pixel(x + 2, y);
-				next_buffer[y * width + x].r = min((top.r + bottom.r + left.r + right.r) / 8 + (top2.r + bottom2.r + left2.r + right2.r) / 8, 255);
-				next_buffer[y * width + x].g = min((top.g + bottom.g + left.g + right.g) / 8 + (top2.g + bottom2.g + left2.g + right2.g) / 8, 255);
-				next_buffer[y * width + x].b = min((top.b + bottom.b + left.b + right.b) / 8 + (top2.b + bottom2.b + left2.b + right2.b) / 8, 255);
-				next_buffer[y * width + x].a = min((top.a + bottom.a + left.a + right.a) / 10 + (top2.a + bottom2.a + left2.a + right2.a) / 12, 255);
-			}
-		}
-		internal_buffer = std::move(next_buffer);
+		decay_rows(internal_buffer.data(), next_buffer.data(), width, height, 0, height);
+		internal_buffer.swap(next_buffer);
 		return src;
 	}
 };
 
 // Factory function for AviSynth+
-AVSValue __stdcall Create_UltraVis(AVSValue args, void* user_data, IScriptEnvironment* env) { return new UltraVisualizer(args[0].AsClip(), env); }
+AVSValue __cdecl Create_UltraVis(AVSValue args, void* user_data, IScriptEnvironment* env) { return new UltraVisualizer(args[0].AsClip(), env); }
 
 // Plugin registration when loading the DLL
 const AVS_Linkage* AVS_linkage = 0;

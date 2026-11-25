@@ -9,6 +9,7 @@
 #include <mutex>
 #include <condition_variable>
 #include "avisynth.h"
+#include "Decay.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -21,12 +22,6 @@ constexpr const T& clamp(const T& v, const T& lo, const T& hi)
 	return (v < lo) ? lo : (hi < v) ? hi : v;
 }
 #endif
-
-// Structure for an RGBA pixel of the internal clip
-struct PixelRGBA
-{
-	BYTE r, g, b, a;
-};
 
 // Helper function for color calculation of the frequency splines via cosine functions
 void
@@ -257,6 +252,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 	static const int MAX_AHEAD = 32;
 
 	int width, height;
+	DecayRows* const decay_rows;
 	std::vector<PixelRGBA> internal_buffer; // Internal storage clip in RGBA32 format
 	std::vector<PixelRGBA> next_buffer;
 	std::map<int, SpectrumPlan> plans;
@@ -510,43 +506,11 @@ class UltraVisualizerMT : public GenericVideoFilter
 			});
 	}
 
-	// --- 4. Pixel feedback/decay of the internal clip (Box blur attenuation) ---
-	void
-		DecayBuffer()
+	void DecayBuffer()
 	{
-		auto blend = [](const PixelRGBA& top, const PixelRGBA& bottom, const PixelRGBA& left, const PixelRGBA& right,
-			const PixelRGBA& top2, const PixelRGBA& bottom2, const PixelRGBA& left2, const PixelRGBA& right2, PixelRGBA& out) {
-				out.r = (BYTE)(std::min)((top.r + bottom.r + left.r + right.r) / 8 + (top2.r + bottom2.r + left2.r + right2.r) / 8, 255);
-				out.g = (BYTE)(std::min)((top.g + bottom.g + left.g + right.g) / 8 + (top2.g + bottom2.g + left2.g + right2.g) / 8, 255);
-				out.b = (BYTE)(std::min)((top.b + bottom.b + left.b + right.b) / 8 + (top2.b + bottom2.b + left2.b + right2.b) / 8, 255);
-				out.a = (BYTE)(std::min)((top.a + bottom.a + left.a + right.a) / 10 + (top2.a + bottom2.a + left2.a + right2.a) / 12, 255);
-			};
-
-		pool.Run(height, [&](int y0, int y1) {
-			for (int y = y0; y < y1; ++y)
-			{
-				const PixelRGBA* row = &internal_buffer[y * width];
-				const PixelRGBA* up1 = &internal_buffer[clamp(y - 1, 0, height - 1) * width];
-				const PixelRGBA* up2 = &internal_buffer[clamp(y - 2, 0, height - 1) * width];
-				const PixelRGBA* dn1 = &internal_buffer[clamp(y + 1, 0, height - 1) * width];
-				const PixelRGBA* dn2 = &internal_buffer[clamp(y + 2, 0, height - 1) * width];
-				PixelRGBA* out = &next_buffer[y * width];
-
-				auto edge = [&](int x) {
-					int l1 = clamp(x - 1, 0, width - 1), l2 = clamp(x - 2, 0, width - 1);
-					int r1 = clamp(x + 1, 0, width - 1), r2 = clamp(x + 2, 0, width - 1);
-					blend(up1[x], dn1[x], row[l1], row[r1], up2[x], dn2[x], row[l2], row[r2], out[x]);
-					};
-
-				int inner_end = width - 2;
-				for (int x = 0; x < (std::min)(2, width); ++x)
-					edge(x);
-				for (int x = 2; x < inner_end; ++x)
-					blend(up1[x], dn1[x], row[x - 1], row[x + 1], up2[x], dn2[x], row[x - 2], row[x + 2], out[x]);
-				for (int x = (std::max)(2, inner_end); x < width; ++x)
-					edge(x);
-			}
-			});
+		pool.Run(height, [&](int begin, int end) {
+			decay_rows(internal_buffer.data(), next_buffer.data(), width, height, begin, end);
+		});
 		internal_buffer.swap(next_buffer);
 	}
 
@@ -590,7 +554,8 @@ class UltraVisualizerMT : public GenericVideoFilter
 	}
 
 public:
-	UltraVisualizerMT(PClip _child, int threads, IScriptEnvironment* env) : GenericVideoFilter(_child), pool(AutoThreads(threads))
+	UltraVisualizerMT(PClip _child, int threads, IScriptEnvironment* env)
+		: GenericVideoFilter(_child), decay_rows(SelectDecayRows(env->GetCPUFlags())), pool(AutoThreads(threads))
 	{
 		if (!vi.HasVideo())
 		{
